@@ -1,0 +1,170 @@
+--------CLOUD VARIABLES	
+#Make sure the active subscription is set correctly
+SUBSCRIPTION_ACCOUNT=$(az account show)
+echo $SUBSCRIPTION_ACCOUNT
+
+# Get the tenant ID
+TENANT_ID=$(echo $SUBSCRIPTION_ACCOUNT | jq -r .tenantId)
+# or use TENANT_ID=$(az account show --query tenantId -o tsv)
+echo $TENANT_ID
+echo export TENANT_ID=$TENANT_ID >> ~/.bashrc
+
+# Get the subscription ID
+SUBSCRIPTION_ID=$(echo $SUBSCRIPTION_ACCOUNT | jq -r .id)
+# or use TENANT_ID=$(az account show --query tenantId -o tsv)
+echo $SUBSCRIPTION_ID
+echo export SUBSCRIPTION_ID=$SUBSCRIPTION_ID >> ~/.bashrc
+
+
+RG_NAME=<ENTER RG NAME HERE>
+echo export RG_NAME=$RG_NAME >> ~/.bashrc
+
+LOCATION=westeurope
+echo export LOCATION=$LOCATION >> ~/.bashrc
+
+SUBNET_NAME=<ENTER SUBNET NAME HERE>
+echo export SUBNET_NAME=$SUBNET_NAME >> ~/.bashrc
+
+VNET_NAME=<ENTER VNET NAME HERE>
+echo export VNET_NAME=$VNET_NAME >> ~/.bashrc
+
+SUBNET_ID=$(az network vnet subnet show \
+--resource-group $RG_NAME \
+--vnet-name $VNET_NAME \
+--name $SUBNET_NAME \
+--query id -o tsv)
+echo export SUBNET_ID=$SUBNET_ID >> ~/.bashrc
+
+CLUSTER_NAME=<ENTER CLUSTER NAME HERE>
+echo export CLUSTER_NAME=$CLUSTER_NAME>> ~/.bashrc
+
+K8S_VERSION=$(az aks get-versions -l $LOCATION --query "orchestrators[?isPreview==null].{Version:orchestratorVersion} | [-1]" -o tsv)
+
+
+
+--------AAD CREATION
+# Create the Azure AD application to act as identity endpoint for the identity requests
+SERVER_APP_ID=$(az ad app create \
+    --display-name "${CLUSTER_NAME}-server" \
+    --identifier-uris "https://${CLUSTER_NAME}-server" \
+    --query appId -o tsv)
+echo $SERVER_APP_ID
+echo export SERVER_APP_ID=$SERVER_APP_ID >> ~/.bashrc
+# Update the application group membership claims
+az ad app update --id $SERVER_APP_ID --set groupMembershipClaims=All
+
+# Create a service principal for the Azure AD app to use it to authenticate itself
+az ad sp create --id $SERVER_APP_ID
+
+# Get the service principal secret through reset :) This will work also with existing SP
+SERVER_APP_SECRET=$(az ad sp credential reset \
+    --name $SERVER_APP_ID \
+    --credential-description "AKSPassword" \
+    --query password -o tsv)
+echo $SERVER_APP_SECRET
+echo export SERVER_APP_SECRET=$SERVER_APP_SECRET >> ~/.bashrc
+# Assigning permissions for readying directory, sign in and read user profile data to SP
+az ad app permission add \
+    --id $SERVER_APP_ID \
+    --api 00000003-0000-0000-c000-000000000000 \
+    --api-permissions e1fe6dd8-ba31-4d61-89e7-88639da4683d=Scope 06da0dbc-49e2-44d2-8312-53f166ab848a=Scope 7ab1d382-f21e-4acd-a863-ba3e13f7da61=Role
+
+# Now granting them. Expect "Forbidden" error if you are not Azure tenant admin :(
+az ad app permission grant --id $SERVER_APP_ID --api 00000003-0000-0000-c000-000000000000
+# As we need Read All data, we require the admin consent (this require AAD tenant admin)
+# Azure tenant admin can login to AAD and grant this from the portal
+# CloudShell'den Hata Aldık - Portal'den çözdük
+az ad app permission admin-consent --id  $SERVER_APP_ID
+
+### Client AAD Setup (like when a user connects using kubectl)
+
+# Create new AAD app
+CLIENT_APP_ID=$(az ad app create \
+    --display-name "${CLUSTER_NAME}-client" \
+    --native-app \
+    --reply-urls "https://${CLUSTER_NAME}-client" \
+    --query appId -o tsv)
+echo $CLIENT_APP_ID
+echo export CLIENT_APP_ID=$CLIENT_APP_ID >> ~/.bashrc
+
+# Creation SP for the client
+az ad sp create --id $CLIENT_APP_ID
+
+# We need the OAuth token from the server app created in the previous step. This will allow authentication flow between the two app components
+OAUTH_PREMISSION_ID=$(az ad app show --id $SERVER_APP_ID --query "oauth2Permissions[0].id" -o tsv)
+echo export OAUTH_PREMISSION_ID=$OAUTH_PREMISSION_ID >> ~/.bashrc
+
+# Adding and granting OAuth flow between the server and client apps
+az ad app permission add --id $CLIENT_APP_ID --api $SERVER_APP_ID --api-permissions $OAUTH_PREMISSION_ID=Scope
+
+# Again with the "Forbidden" error if you are not Azure tenant admin
+az ad app permission grant --id $CLIENT_APP_ID --api $SERVER_APP_ID
+
+#***** END Prepare AAD for AKS *****
+
+
+
+
+--------SP CREATE
+
+#az ad sp create-for-rbac --name aksclustersp --skip-assignment > secrets.json
+az ad sp create-for-rbac --name aksclustersp --scopes /subscriptions/<ENTER SUBSCRIPTION ID HERE>/resourceGroups/<ENTER SUBNET NAME HERE> > secrets.json
+
+--------SP VARIABLES
+APP_ID=574dbe45-9f55-4270-9d66-3c89bd9a5ce1 && \
+	echo export APP_ID=$APP_ID >> ~/.bashrc
+	
+APP_ID=$(jq -r .appId secrets.json) && \
+	echo export APP_ID=$APP_ID >> ~/.bashrc	
+	
+CLIENT_PASSWORD=$(jq -r .password secrets.json) && \
+	echo export CLIENT_PASSWORD=$CLIENT_PASSWORD >> ~/.bashrc
+	
+CLIENT_PASSWORD=d961ad64-1b89-44f7-a024-81dea33f4a33 && \
+	echo export CLIENT_PASSWORD=$CLIENT_PASSWORD >> ~/.bashrc	
+
+
+--------PUBLIC EGRESS IP
+PREFIX=<ENTER PREFIX HERE>
+
+# Provision a standard public IP
+AKS_PIP_NAME="${PREFIX}-k8s-pip"
+AKS_PIP=$(az network public-ip create -g $RG_NAME --name $AKS_PIP_NAME --sku Standard)
+echo $AKS_PIP | jq
+
+# I'm getting the Public IP from Azure rather than using jq on $AKS_PIP for demonstration on getting existing PIP
+AKS_PIP_ID=$(az network public-ip show -g $RG_NAME --name $AKS_PIP_NAME --query id -o tsv)
+echo $AKS_PIP_ID
+
+# Saving value
+echo export AKS_PIP_ID=$AKS_PIP_ID >> ~/.bashrc
+	
+--------
+az aks create \
+--resource-group $RG_NAME \
+--name $CLUSTER_NAME \
+--vm-set-type VirtualMachineScaleSets \
+--load-balancer-sku standard \
+--load-balancer-outbound-ips $AKS_PIP_ID \
+--location $LOCATION \
+--kubernetes-version $K8S_VERSION \
+--network-plugin azure \
+--vnet-subnet-id $SUBNET_ID \
+--service-cidr 10.2.0.0/24 \
+--dns-service-ip 10.2.0.10 \
+--docker-bridge-address 172.17.0.1/16 \
+--service-principal $APP_ID \
+--client-secret $CLIENT_PASSWORD \
+--generate-ssh-keys \
+--no-wait \
+--node-vm-size Standard_F8s \
+--node-count 3 \
+--max-pods 30 \
+--min-count 1 \
+--max-count 5 \
+--nodepool-labels app=default \
+--aad-server-app-id $SERVER_APP_ID \
+--aad-server-app-secret $SERVER_APP_SECRET \
+--aad-client-app-id $CLIENT_APP_ID \
+--aad-tenant-id $TENANT_ID \
+--enable-cluster-autoscaler
